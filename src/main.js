@@ -1,4 +1,3 @@
-// === src/main.js (keyword search -> m-dot -> www -> SERP fallback, UA mobile, debug) ===
 import { Actor, KeyValueStore, Dataset } from 'apify';
 import { PlaywrightCrawler, ProxyConfiguration, log } from 'crawlee';
 
@@ -64,25 +63,27 @@ const gotoRobust = async (page, url) => {
   }
 };
 
-// --- DEBUG: screenshot + HTML vers KV ---
+// --- DEBUG helpers: screenshot + HTML vers KV ---
 const saveDebug = async (page, prefix = 'DEBUG') => {
   try {
+    const store = await KeyValueStore.open();
     const png = await page.screenshot({ fullPage: true });
     const html = await page.content();
     const ts = Date.now();
-    await (await KeyValueStore.open()).setValue(`${prefix}_${ts}.png`, png, { contentType: 'image/png' });
-    await (await KeyValueStore.open()).setValue(`${prefix}_${ts}.html`, html, { contentType: 'text/html; charset=utf-8' });
+    await store.setValue(`${prefix}_${ts}.png`, png, { contentType: 'image/png' });
+    await store.setValue(`${prefix}_${ts}.html`, html, { contentType: 'text/html; charset=utf-8' });
     log.info(`${prefix}: artefacts sauvegardés dans KV (png + html)`);
   } catch (e) {
     log.warning(`${prefix}: échec sauvegarde debug -> ${e?.message || e}`);
   }
 };
 
-// --- SERP fallback: Google / Bing / DuckDuckGo (payload string !) ---
-const serpFetch = async (engineActor, queryString) => {
+// --- SERP fallback (Google UNIQUEMENT) ---
+const serpGoogle = async (queryString) => {
   try {
-    const run = await Actor.call(engineActor, {
-      // IMPORTANT: Certains Actors attendent "queries" en STRING, pas en array.
+    log.info(`SERP(Google): ${queryString}`);
+    const run = await Actor.call('apify/google-search-scraper', {
+      // IMPORTANT: queries doit être une STRING (pas un array)
       queries: queryString,
       resultsPerPage: 25,
       maxPagesPerQuery: 1,
@@ -96,7 +97,7 @@ const serpFetch = async (engineActor, queryString) => {
       .filter((u) => typeof u === 'string' && /kuaishou\.com\/(short-video|f)\//i.test(u));
     return unique(urls);
   } catch (e) {
-    log.warning(`SERP (${engineActor}) error: ${e?.message || e}`);
+    log.warning(`SERP(Google) error: ${e?.message || e}`);
     return [];
   }
 };
@@ -126,16 +127,16 @@ const proxyConfiguration = useApifyProxy
 const kv = await KeyValueStore.open();
 const dataset = await Dataset.open();
 
-// --- Seeds: on essaye M-DOT PUIS WWW pour le mot-clé ---
+// --- Seeds: M-DOT PUIS WWW pour le mot-clé ---
 const startRequests = [];
 if (keyword) {
   startRequests.push({
     url: `https://m.kuaishou.com/search/video?keyword=${encodeURIComponent(keyword)}`,
-    userData: { label: 'SEARCH', triedMDot: true },
+    userData: { label: 'SEARCH', origin: 'm' },
   });
   startRequests.push({
     url: `https://www.kuaishou.com/search/video?keyword=${encodeURIComponent(keyword)}`,
-    userData: { label: 'SEARCH', triedMDot: false },
+    userData: { label: 'SEARCH', origin: 'www' },
   });
 }
 for (const u of urlList) {
@@ -187,9 +188,8 @@ const crawler = new PlaywrightCrawler({
     const currentUrl = page.url();
     try { await page.waitForSelector('body', { timeout: 15000 }); } catch {}
 
-    // --- SEARCH flow ---
     if (label === 'SEARCH') {
-      // cliquer l’onglet "视频" si visible
+      // clique l’onglet "视频" si visible
       try {
         const tabVideo = page.locator('text=视频');
         if (await tabVideo.count()) {
@@ -198,21 +198,22 @@ const crawler = new PlaywrightCrawler({
         }
       } catch {}
 
-      // attendre un sélecteur plausible
+      // plus de sélecteurs plausibles
       const anySelector = [
         'a[href*="/short-video/"]',
+        'a[href*="/f/"]',
         'div[data-e2e*="card"] a[href]',
         'section a[href*="/short-video/"]',
-        'a[href*="/f/"]',
+        'div:has(video) a[href*="/short-video/"]',
       ].join(',');
       try { await page.waitForSelector(anySelector, { timeout: 30000 }); } catch {}
 
       await autoScroll(page, 7);
 
-      // 1) DOM
+      // DOM direct
       let hrefs = await page.$$eval('a[href]', (as) => as.map((a) => a.href));
 
-      // 2) regex HTML si DOM pauvre
+      // regex HTML si DOM pauvre
       if (!hrefs || hrefs.length < 5) {
         try {
           const html = await page.content();
@@ -223,20 +224,11 @@ const crawler = new PlaywrightCrawler({
 
       let videoLinks = unique((hrefs || []).filter((h) => /\/short-video\/|\/f\//i.test(h)));
 
-      // 3) SERP fallback en dernier
+      // Fallback: SERP Google uniquement
       if ((!videoLinks.length) && useSerpFallback && keyword) {
-        const qCN = `site:kuaishou.com/short-video ${keyword}`;
-        log.info(`SERP(Google): ${qCN}`);
-        let serpUrls = await serpFetch('apify/google-search-scraper', qCN);
-        if (!serpUrls.length) {
-          log.info(`SERP(Bing): ${qCN}`);
-          serpUrls = await serpFetch('apify/bing-search-scraper', qCN);
-        }
-        if (!serpUrls.length) {
-          log.info(`SERP(DDG): ${qCN}`);
-          serpUrls = await serpFetch('apify/duckduckgo-search-scraper', qCN);
-        }
-        videoLinks = serpUrls;
+        const q = `site:kuaishou.com/short-video ${keyword}`;
+        const serpUrls = await serpGoogle(q);
+        videoLinks = serpUrls.slice(0, Math.max(1, Math.min(limit, 50)));
       }
 
       if (!videoLinks.length) {
@@ -246,7 +238,7 @@ const crawler = new PlaywrightCrawler({
         return;
       }
 
-      // scoring approximatif (likes) depuis texte autour
+      // scoring rapide (likes) depuis le texte autour
       const cardsScored = await page.evaluate((links) => {
         const around = (u) => {
           const a = [...document.querySelectorAll('a[href]')].find((x) => x.href === u);
@@ -286,21 +278,13 @@ const crawler = new PlaywrightCrawler({
       return;
     }
 
-    // --- DETAIL flow ---
+    // === DETAIL ===
     const videoUrl = await extractVideoUrl(page, { acceptM3U8, preBag: sniffer.bag });
-    if (!videoUrl) {
-      await saveDebug(page, 'DEBUG_DETAIL');
-    }
+    if (!videoUrl) await saveDebug(page, 'DEBUG_DETAIL');
     sniffer.detach();
 
     const title = await page.title().catch(() => '');
-    const item = {
-      pageUrl: currentUrl,
-      title,
-      videoUrl: videoUrl || null,
-      likes: request.userData?.likes ?? null,
-      rank: request.userData?.rank ?? null,
-    };
+    const item = { pageUrl: currentUrl, title, videoUrl: videoUrl || null, likes: request.userData?.likes ?? null, rank: request.userData?.rank ?? null };
     await dataset.pushData(item);
 
     if (saveBinary && videoUrl && /\.mp4(\?|$)/i.test(videoUrl)) {
@@ -325,7 +309,7 @@ const crawler = new PlaywrightCrawler({
 await crawler.run(
   startRequests.length
     ? startRequests
-    : [{ url: 'https://m.kuaishou.com/search/video?keyword=cute', userData: { label: 'SEARCH', triedMDot: true } }],
+    : [{ url: 'https://m.kuaishou.com/search/video?keyword=cute', userData: { label: 'SEARCH', origin: 'm' } }],
 );
 
 await Actor.exit();
