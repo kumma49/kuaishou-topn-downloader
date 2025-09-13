@@ -1,5 +1,5 @@
 // === src/main.js ===
-// Kuaishou Top-N downloader : search robuste (www + m-dot + SERP Google/Bing/DDG) + capture MP4 dans KV
+// Mode fiable: traite des liens Kuaishou (DETAIL) + recherche optionnelle si proxy résidentiel activé.
 
 import { Actor, KeyValueStore, Dataset } from 'apify';
 import { PlaywrightCrawler, ProxyConfiguration, log } from 'crawlee';
@@ -7,8 +7,10 @@ import { PlaywrightCrawler, ProxyConfiguration, log } from 'crawlee';
 // -------------------- Helpers --------------------
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const unique = (arr) => [...new Set(arr)];
+
+// UA mobile Android + WeChat (souvent mieux côté CN)
 const UA_MOBILE =
-  'Mozilla/5.0 (iPhone; CPU iPhone OS 16_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.6 Mobile/15E148 Safari/604.1';
+  'Mozilla/5.0 (Linux; Android 13; Pixel 7 Pro) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36 MicroMessenger/8.0.45';
 
 const parseCount = (txt = '') => {
   const w = txt.match(/([\d.,]+)\s*(w|万)/i);
@@ -47,7 +49,7 @@ const extractVideoUrl = async (page, { acceptM3U8, preBag = [] }) => {
   const dom = await page.$$eval('video, source', (els) =>
     els.map((e) => e.src || e.getAttribute('src')).filter(Boolean),
   );
-  // 2) JSON/HTML heuristics (parfois l’URL apparaît dans le HTML)
+  // 2) regex HTML fallback
   let htmlUrls = [];
   try {
     const html = await page.content();
@@ -58,24 +60,6 @@ const extractVideoUrl = async (page, { acceptM3U8, preBag = [] }) => {
   return pickBestUrl(merged, acceptM3U8);
 };
 
-// Scroll + récolte incrémentale des <a href>
-const incrementalScrollAndHarvest = async (page, steps = 7) => {
-  const harvested = new Set();
-  for (let i = 0; i < steps; i++) {
-    await page.evaluate(async () => {
-      window.scrollBy(0, 1400);
-      await new Promise(r => setTimeout(r, 650));
-    });
-    await sleep(550 + Math.floor(Math.random() * 450));
-    try {
-      const hrefs = await page.$$eval('a[href]', (as) => as.map(a => a.href));
-      hrefs.forEach(h => harvested.add(h));
-    } catch {}
-  }
-  return [...harvested];
-};
-
-// Nav robuste
 const gotoRobust = async (page, url) => {
   try {
     await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 60000 });
@@ -100,69 +84,38 @@ const saveDebug = async (page, prefix = 'DEBUG') => {
   }
 };
 
-// ------ SERP providers (Google, Bing, DuckDuckGo) ------
-const serpSearchGoogle = async (keyword) => {
-  const query = `site:kuaishou.com/short-video ${keyword}`;
-  log.info(`SERP(Google): ${query}`);
-  const run = await Actor.call('apify/google-search-scraper', {
-    queries: query, // IMPORTANT: string, pas tableau
-    resultsPerPage: 25,
-    maxPagesPerQuery: 1,
-    mobileResults: true,
-    saveHtml: false,
-  });
-  const dsId = run?.defaultDatasetId || run?.output?.defaultDatasetId || run?.datasetId;
-  if (!dsId) return [];
-  const ds = await Actor.openDataset(dsId);
-  const { items } = await ds.getData({ limit: 200 });
-  return (items || []).map(i => i?.url).filter(u => /kuaishou\.com\/(short-video|f)\//i.test(u));
-};
+// --- SERP (optionnel) ---
+const trySerpAgg = async (keyword, limit) => {
+  const take = (dsId) => dsId ? Actor.openDataset(dsId).then(ds => ds.getData({ limit: 200 })) : null;
 
-const serpSearchBing = async (keyword) => {
-  const query = `site:kuaishou.com/short-video ${keyword}`;
-  log.info(`SERP(Bing): ${query}`);
-  const run = await Actor.call('apify/bing-search-scraper', {
-    query, // ce scraper prend "query"
-    maxPagesPerQuery: 1,
-    countryCode: 'HK',
-    useMobileVersion: true,
-  });
-  const dsId = run?.defaultDatasetId || run?.output?.defaultDatasetId || run?.datasetId;
-  if (!dsId) return [];
-  const ds = await Actor.openDataset(dsId);
-  const { items } = await ds.getData({ limit: 200 });
-  return (items || []).map(i => i?.url).filter(u => /kuaishou\.com\/(short-video|f)\//i.test(u));
-};
+  const tasks = [];
+  // Google
+  tasks.push(Actor.call('apify/google-search-scraper', {
+    queries: `site:kuaishou.com/short-video ${keyword}`, // string (pas tableau)
+    resultsPerPage: 25, maxPagesPerQuery: 1, mobileResults: true, saveHtml: false,
+  }).then(run => run?.defaultDatasetId || run?.output?.defaultDatasetId || run?.datasetId).then(take));
+  // Bing
+  tasks.push(Actor.call('apify/bing-search-scraper', {
+    query: `site:kuaishou.com/short-video ${keyword}`,
+    maxPagesPerQuery: 1, countryCode: 'HK', useMobileVersion: true,
+  }).then(run => run?.defaultDatasetId || run?.output?.defaultDatasetId || run?.datasetId).then(take));
+  // DuckDuckGo
+  tasks.push(Actor.call('apify/duckduckgo-search-scraper', {
+    queries: `site:kuaishou.com/short-video ${keyword}`,
+    maxResults: 25, region: 'wt-wt', safeSearch: 'moderate',
+  }).then(run => run?.defaultDatasetId || run?.output?.defaultDatasetId || run?.datasetId).then(take));
 
-const serpSearchDDG = async (keyword) => {
-  const query = `site:kuaishou.com/short-video ${keyword}`;
-  log.info(`SERP(DDG): ${query}`);
-  const run = await Actor.call('apify/duckduckgo-search-scraper', {
-    queries: query, // ce scraper accepte string aussi
-    maxResults: 25,
-    region: 'wt-wt',
-    safeSearch: 'moderate',
-  });
-  const dsId = run?.defaultDatasetId || run?.output?.defaultDatasetId || run?.datasetId;
-  if (!dsId) return [];
-  const ds = await Actor.openDataset(dsId);
-  const { items } = await ds.getData({ limit: 200 });
-  return (items || []).map(i => i?.url).filter(u => /kuaishou\.com\/(short-video|f)\//i.test(u));
-};
-
-const serpSearch = async (keyword) => {
-  // On agrège les trois, on dédoublonne
-  const [g, b, d] = await Promise.allSettled([
-    serpSearchGoogle(keyword),
-    serpSearchBing(keyword),
-    serpSearchDDG(keyword),
-  ]);
-  const urls = [
-    ...(g.status === 'fulfilled' ? g.value : []),
-    ...(b.status === 'fulfilled' ? b.value : []),
-    ...(d.status === 'fulfilled' ? d.value : []),
-  ];
-  return unique(urls);
+  const settled = await Promise.allSettled(tasks);
+  const urls = [];
+  for (const s of settled) {
+    if (s.status === 'fulfilled' && s.value && s.value.items) {
+      for (const it of s.value.items) {
+        const u = it?.url;
+        if (typeof u === 'string' && /kuaishou\.com\/(short-video|f)\//i.test(u)) urls.push(u);
+      }
+    }
+  }
+  return unique(urls).slice(0, Math.max(1, Math.min(limit || 3, 50)));
 };
 
 // -------------------- Main --------------------
@@ -170,15 +123,17 @@ await Actor.init();
 
 const input = (await Actor.getInput()) || {};
 const {
-  keyword,
+  // MODE A (fiable): fournis des /f/... ou /short-video/... ici
   urlList = [],
+  // MODE B (optionnel): recherche (nécessite proxy résidentiel HK/CN)
+  keyword,
   limit = 3,
   useApifyProxy = true,
   saveBinary = true,
   acceptM3U8 = false,
-  // si tu veux exposer ces champs dans l’UI, ajoute-les dans input_schema.json
-  apifyProxyGroups,
-  apifyProxyCountry,
+  useSerpFallback = false,            // <— n’active la SERP que si tu es sûr d’avoir du résidentiel
+  apifyProxyGroups,                   // ex: ["RESIDENTIAL"]
+  apifyProxyCountry,                  // ex: "HK" ou "CN"
 } = input;
 
 const proxyConfiguration = useApifyProxy
@@ -193,23 +148,12 @@ const dataset = await Dataset.open();
 
 // Seeds
 const startRequests = [];
-if (keyword) {
-  startRequests.push({
-    url: `https://www.kuaishou.com/search/video?keyword=${encodeURIComponent(keyword)}`,
-    userData: { label: 'SEARCH', source: 'www', keyword, triedMDot: false },
-  });
-  startRequests.push({
-    url: `https://m.kuaishou.com/search/video?keyword=${encodeURIComponent(keyword)}`,
-    userData: { label: 'SEARCH', source: 'm', keyword, triedMDot: true },
-  });
-  // SERP synthétique (pas de navigation)
-  startRequests.push({
-    url: 'about:blank',
-    userData: { label: 'SERP', keyword },
-  });
-}
 for (const u of urlList) {
   startRequests.push({ url: u, userData: { label: 'DETAIL', likes: 0, rank: null } });
+}
+if (keyword && useSerpFallback) {
+  // on pousse seulement SERP (économise des échecs sur /search/)
+  startRequests.push({ url: 'about:blank', userData: { label: 'SERP', keyword } });
 }
 
 const crawler = new PlaywrightCrawler({
@@ -225,12 +169,17 @@ const crawler = new PlaywrightCrawler({
 
   preNavigationHooks: [
     async ({ page }) => {
-      // Forcer UA mobile + signaux "mobile"
+      // Spoofs simples anti-bot + UA
       try {
         await page.addInitScript((ua) => {
           Object.defineProperty(navigator, 'userAgent', { get: () => ua });
-          Object.defineProperty(navigator, 'platform', { get: () => 'iPhone' });
+          Object.defineProperty(navigator, 'platform', { get: () => 'Linux armv8' });
           Object.defineProperty(navigator, 'maxTouchPoints', { get: () => 5 });
+          Object.defineProperty(navigator, 'languages', { get: () => ['zh-CN', 'zh', 'en'] });
+          Object.defineProperty(navigator, 'webdriver', { get: () => false });
+          // Plugins/mimeTypes fake
+          Object.defineProperty(navigator, 'plugins', { get: () => [1,2,3] });
+          Object.defineProperty(navigator, 'mimeTypes', { get: () => [1] });
         }, UA_MOBILE);
       } catch {}
       try { await page.setViewportSize({ width: 390, height: 844 }); } catch {}
@@ -249,18 +198,16 @@ const crawler = new PlaywrightCrawler({
     const { label, keyword: kw } = request.userData || {};
     log.info(`Open: [${label || 'DETAIL'}] ${request.url}`);
 
-    // Cas spécial: SERP synthétique
     if (label === 'SERP') {
       try {
-        const serpUrls = await serpSearch(kw);
-        const pick = serpUrls.slice(0, Math.max(1, Math.min(limit || 3, 50)));
-        if (pick.length) {
+        const serpUrls = await trySerpAgg(kw, limit);
+        if (serpUrls.length) {
           await enqueueLinks({
-            urls: pick,
+            urls: serpUrls,
             userData: { label: 'DETAIL', likes: 0, rank: null },
             forefront: true,
           });
-          log.info(`SERP: ${pick.length} liens ajoutés depuis SERP (agg).`);
+          log.info(`SERP: ${serpUrls.length} liens ajoutés.`);
         } else {
           log.warning('SERP: aucun lien trouvé.');
         }
@@ -270,7 +217,7 @@ const crawler = new PlaywrightCrawler({
       return;
     }
 
-    // Sniffer AVANT d’interagir
+    // Sniffer AVANT d’interagir + navigation robuste
     const sniffer = attachSniffer(page);
     await gotoRobust(page, request.url);
 
@@ -278,87 +225,9 @@ const crawler = new PlaywrightCrawler({
     try { await page.waitForURL(/short-video|video/i, { timeout: 15000 }); } catch {}
     try { await page.waitForSelector('body', { timeout: 15000 }); } catch {}
 
-    if (label === 'SEARCH') {
-      // Onglet "视频"
-      try {
-        const tabVideo = page.locator('text=视频');
-        if (await tabVideo.count()) {
-          await tabVideo.first().click();
-          await page.waitForTimeout(1200);
-        }
-      } catch {}
-
-      // Attente de sélecteurs plausibles
-      const anySelector = [
-        'a[href*="/short-video/"]',
-        'div[data-e2e*="card"] a[href]',
-        'section a[href*="/short-video/"]',
-      ].join(',');
-      try { await page.waitForSelector(anySelector, { timeout: 30000 }); } catch {}
-
-      // Scroll + harvest
-      let hrefs = await incrementalScrollAndHarvest(page, 7);
-
-      // Fallback regex HTML
-      if (!hrefs || hrefs.length < 5) {
-        try {
-          const html = await page.content();
-          const viaRegex = html.match(/https:\/\/www\.kuaishou\.com\/(?:short-video|f)\/[A-Za-z0-9_-]+/g) || [];
-          hrefs = [...new Set([...(hrefs || []), ...viaRegex])];
-        } catch {}
-      }
-
-      const videoLinks = unique((hrefs || []).filter(h => /\/short-video\/|\/f\//i.test(h)));
-
-      if (!videoLinks.length) {
-        await saveDebug(page, 'DEBUG_SEARCH');
-        log.warning('SEARCH: aucun lien vidéo détecté (voir DEBUG_SEARCH_* dans KV).');
-        sniffer.detach();
-        return;
-      }
-
-      // Score approximatif (likes) pour Top-N
-      const cardsScored = await page.evaluate((links) => {
-        const around = (u) => {
-          const a = [...document.querySelectorAll('a[href]')].find(x => x.href === u);
-          if (!a) return '';
-          const t = a.innerText || '';
-          const p = a.closest('article,section,div')?.innerText || '';
-          return `${t}\n${p}`.slice(0, 500);
-        };
-        return links.map(u => ({ url: u, context: around(u) }));
-      }, videoLinks).catch(() => videoLinks.map(u => ({ url: u, context: '' })));
-
-      for (const c of cardsScored) {
-        const m = c.context.match(/([\d.,]+\s*(?:w|万)|\d+)/i);
-        c.likeCount = m ? (() => {
-          const m2 = m[0];
-          const w = m2.match(/([\d.,]+)\s*(w|万)/i);
-          if (w) return Math.round(parseFloat(w[1].replace(',', '.')) * 10000);
-          const n = m2.replace(/[^\d]/g, '');
-          return n ? parseInt(n, 10) : 0;
-        })() : 0;
-      }
-
-      const top = cardsScored
-        .sort((a, b) => (b.likeCount || 0) - (a.likeCount || 0))
-        .slice(0, Math.max(1, Math.min(limit || 3, 50)));
-
-      let rank = 1;
-      for (const t of top) {
-        await enqueueLinks({
-          urls: [t.url],
-          userData: { label: 'DETAIL', likes: t.likeCount || 0, rank },
-          forefront: true,
-        });
-        rank++;
-      }
-      sniffer.detach();
-      return;
-    }
-
     // DETAIL : extraire l’URL vidéo + sauvegarder MP4
     const videoUrl = await extractVideoUrl(page, { acceptM3U8, preBag: sniffer.bag });
+    if (!videoUrl) await saveDebug(page, 'DEBUG_DETAIL');
     sniffer.detach();
 
     const title = await page.title().catch(() => '');
@@ -394,7 +263,7 @@ const crawler = new PlaywrightCrawler({
 await crawler.run(
   startRequests.length
     ? startRequests
-    : [{ url: 'https://www.kuaishou.com/search/video?keyword=cute', userData: { label: 'SEARCH', source: 'www', keyword: 'cute', triedMDot: false } }],
+    : [{ url: 'about:blank', userData: { label: 'SERP', keyword: '搞笑 狗' } }],
 );
 
 await Actor.exit();
