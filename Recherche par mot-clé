@@ -1,0 +1,7 @@
+{
+  "keyword": "funny dogs",
+  "limit": 3,
+  "useApifyProxy": true,
+  "saveBinary": true,
+  "acceptM3U8": false
+}
