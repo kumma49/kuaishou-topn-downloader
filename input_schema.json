@@ -1,0 +1,18 @@
+{
+  "title": "Kuaishou Top-N Downloader",
+  "type": "object",
+  "properties": {
+    "keyword": { "title": "Keyword (search)", "type": "string" },
+    "urlList": {
+      "title": "Video page URLs (optional)",
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "limit": { "title": "How many videos to download", "type": "integer", "minimum": 1, "maximum": 50, "default": 3 },
+    "useApifyProxy": { "title": "Use Apify Proxy", "type": "boolean", "default": true },
+    "saveBinary": { "title": "Save MP4 to Key-Value Store", "type": "boolean", "default": true },
+    "acceptM3U8": { "title": "Allow HLS (.m3u8) if MP4 not found (won't be downloaded)", "type": "boolean", "default": false }
+  },
+  "required": [],
+  "additionalProperties": false
+}
