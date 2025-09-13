@@ -1,3 +1,4 @@
+// === src/main.js (corrigé) ===
 import { Actor, KeyValueStore, Dataset } from 'apify';
 import { PlaywrightCrawler, ProxyConfiguration, log } from 'crawlee';
 
@@ -34,7 +35,7 @@ const extractVideoUrl = async (page, { acceptM3U8 }) => {
   let candidate = pickBestUrl(unique(dom), acceptM3U8);
   if (candidate) return candidate;
 
-  // 2) Sniff réseau (placer listener avant goto dans handler)
+  // 2) Sniff réseau (listener déjà posé dans le handler avant navigation)
   const bag = [];
   const seen = new Set();
   page.on('response', (resp) => {
@@ -77,7 +78,7 @@ const proxyConfiguration = useApifyProxy
 const kv = await KeyValueStore.open();
 const dataset = await Dataset.open();
 
-// On va faire 2 types de pages: SEARCH (si keyword) et DETAIL (pages vidéo).
+// Pages de départ: SEARCH (si keyword) + DETAIL (si urlList)
 const startRequests = [];
 if (keyword) {
   startRequests.push({
@@ -99,10 +100,20 @@ const crawler = new PlaywrightCrawler({
   retryOnBlocked: true,
   maxRequestRetries: 2,
 
+  // ✅ Définir l'UA/viewport mobile au niveau du context (correct pour Playwright)
+  launchContext: {
+    contextOptions: {
+      userAgent: UA_MOBILE,
+      viewport: { width: 390, height: 844 },
+      isMobile: true,
+      hasTouch: true,
+      deviceScaleFactor: 3,
+    },
+  },
+
+  // (Garde juste un délai léger anti-pattern si tu veux)
   preNavigationHooks: [
-    async ({ page }) => {
-      await page.setUserAgent(UA_MOBILE);
-      await page.setViewportSize({ width: 390, height: 844 });
+    async () => {
       await sleep(300 + Math.floor(Math.random() * 400));
     },
   ],
@@ -113,11 +124,10 @@ const crawler = new PlaywrightCrawler({
 
     await page.goto(request.url, { waitUntil: 'networkidle' });
 
-    // === SEARCH: on récupère les cartes, on score, on enfile top N vers DETAIL ===
+    // === SEARCH: récupérer cartes, scorer, enqueuer Top-N vers DETAIL ===
     if (label === 'SEARCH') {
-      await autoScroll(page, 5); // charge plusieurs écrans
+      await autoScroll(page, 5);
 
-      // Cherche les cartes et extrait url + score likes
       const cards = await page.$$eval('a[href*="/short-video/"]', (as) =>
         as.map((a) => {
           const text = a.innerText || '';
@@ -126,22 +136,18 @@ const crawler = new PlaywrightCrawler({
         })
       );
 
-      // Nettoyage + score
       const dedup = [...new Map(cards.map((c) => [c.href, c])).values()];
       const scored = dedup.map((c) => ({
         url: c.href,
         likes: (c.text && c.text.match(/[\d.,]+\s*(?:w|万)|\d+/i)) ? c.text : '',
       }));
 
-      // Convertit en nombre
       for (const s of scored) s.likeCount = parseCount(s.likes);
 
-      // tri desc & top N
       const top = scored
         .sort((a, b) => b.likeCount - a.likeCount)
         .slice(0, Math.max(1, Math.min(limit, 50)));
 
-      // Enqueue vers DETAIL avec métadonnées (likes/rank)
       let rank = 1;
       for (const t of top) {
         await enqueueLinks({
@@ -151,12 +157,10 @@ const crawler = new PlaywrightCrawler({
         });
         rank++;
       }
-
-      // On sort tout de suite (les DETAIL seront traités)
       return;
     }
 
-    // === DETAIL: on récupère videoUrl + (optionnel) on télécharge MP4 vers KV ===
+    // === DETAIL: extraire videoUrl + (optionnel) sauvegarder MP4 dans KV ===
     const videoUrl = await extractVideoUrl(page, { acceptM3U8 });
     const title = await page.title().catch(() => '');
 
@@ -181,6 +185,13 @@ const crawler = new PlaywrightCrawler({
         log.warning(`Download failed: ${e?.message || e}`);
       }
     }
+
+    // Limite l'exploration – ne reste que sur les pages pertinentes
+    await enqueueLinks({
+      strategy: 'same-domain',
+      globs: ['https://www.kuaishou.com/short-video/**', 'https://www.kuaishou.com/search/video?*'],
+      maxRequestsPerCrawl: 20,
+    });
   },
 
   failedRequestHandler({ request }) {
@@ -188,9 +199,10 @@ const crawler = new PlaywrightCrawler({
   },
 });
 
-await crawler.run(startRequests.length ? startRequests : [{
-  url: 'https://www.kuaishou.com',
-  userData: { label: 'SEARCH' },
-}]);
+await crawler.run(
+  startRequests.length
+    ? startRequests
+    : [{ url: 'https://www.kuaishou.com', userData: { label: 'SEARCH' } }]
+);
 
 await Actor.exit();
