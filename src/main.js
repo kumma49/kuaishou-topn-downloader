@@ -1,4 +1,4 @@
-// === src/main.js (compatible Crawlee 3.14.x) ===
+// === src/main.js (timeouts + headers + retries) ===
 import { Actor, KeyValueStore, Dataset } from 'apify';
 import { PlaywrightCrawler, ProxyConfiguration, log } from 'crawlee';
 
@@ -7,7 +7,6 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const unique = (arr) => [...new Set(arr)];
 
 const parseCount = (txt = '') => {
-  // "1.2w" / "1.2万" => 12000 ; sinon nombre brut
   const w = txt.match(/([\d.,]+)\s*(w|万)/i);
   if (w) return Math.round(parseFloat(w[1].replace(',', '.')) * 10000);
   const n = txt.replace(/[^\d]/g, '');
@@ -62,6 +61,19 @@ const autoScroll = async (page, steps = 4) => {
   }
 };
 
+// Goto robuste (2 stratégies)
+const gotoRobust = async (page, url) => {
+  // Essai 1: domcontentloaded (rapide)
+  try {
+    await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 60000 });
+    return;
+  } catch (e) {
+    log.warning(`goto domcontentloaded failed: ${e.message}`);
+  }
+  // Essai 2: networkidle (si ça passe)
+  await page.goto(url, { waitUntil: 'networkidle', timeout: 60000 });
+};
+
 // --- Programme principal ---
 await Actor.init();
 const input = (await Actor.getInput()) || {};
@@ -72,10 +84,15 @@ const {
   useApifyProxy = true,
   saveBinary = true,
   acceptM3U8 = false,
+  apifyProxyGroups,     // ex: ["RESIDENTIAL"]
+  apifyProxyCountry,    // ex: "US"
 } = input;
 
 const proxyConfiguration = useApifyProxy
-  ? await Actor.createProxyConfiguration()
+  ? await Actor.createProxyConfiguration({
+      groups: Array.isArray(apifyProxyGroups) ? apifyProxyGroups : undefined,
+      countryCode: apifyProxyCountry || undefined,
+    })
   : new ProxyConfiguration();
 
 const kv = await KeyValueStore.open();
@@ -97,17 +114,23 @@ const crawler = new PlaywrightCrawler({
   proxyConfiguration,
   headless: true,
   maxConcurrency: 2,
-  requestHandlerTimeoutSecs: 90,
+  requestHandlerTimeoutSecs: 120, // ↑ un peu
   useSessionPool: true,
   persistCookiesPerSession: true,
   retryOnBlocked: true,
   maxRequestRetries: 2,
 
-  // Pas de userAgent ici (incompatible avec ta version). On ne règle que le viewport.
   preNavigationHooks: [
-    async ({ page }) => {
+    async ({ page, request, session }) => {
+      // viewport "mobile-ish"
+      try { await page.setViewportSize({ width: 390, height: 844 }); } catch {}
+      // headers “plus réalistes”
       try {
-        await page.setViewportSize({ width: 390, height: 844 }); // "mobile-ish"
+        await page.setExtraHTTPHeaders({
+          'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
+          'Upgrade-Insecure-Requests': '1',
+          'Referer': 'https://www.kuaishou.com/',
+        });
       } catch {}
       await sleep(300 + Math.floor(Math.random() * 400));
     },
@@ -119,7 +142,10 @@ const crawler = new PlaywrightCrawler({
 
     // Sniffer AVANT la navigation
     const sniffer = attachSniffer(page);
-    await page.goto(request.url, { waitUntil: 'networkidle' });
+
+    // Navigation robuste + un petit wait sur body
+    await gotoRobust(page, request.url);
+    try { await page.waitForSelector('body', { timeout: 10000 }); } catch {}
 
     if (label === 'SEARCH') {
       await autoScroll(page, 5);
