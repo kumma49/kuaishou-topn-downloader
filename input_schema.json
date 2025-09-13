@@ -1,50 +1,58 @@
 {
   "title": "Kuaishou TopN Downloader",
+  "description": "Cherche les vidéos Kuaishou, sélectionne les Top-N par popularité et télécharge les MP4 (si disponibles).",
   "type": "object",
+  "schemaVersion": 1,
+  "additionalProperties": false,
   "properties": {
     "keyword": {
-      "title": "Search keyword",
+      "title": "Mot-clé de recherche",
       "type": "string",
-      "description": "Keyword to search on Kuaishou."
+      "description": "Mot-clé à chercher sur Kuaishou (laisser vide si vous fournissez des URLs directes)."
     },
     "urlList": {
-      "title": "Direct video URLs",
+      "title": "URLs directes de vidéos",
       "type": "array",
       "items": { "type": "string" },
-      "description": "Optional list of Kuaishou video URLs."
+      "description": "Liste optionnelle d'URLs Kuaishou (ex: /short-video/... ou /f/...)."
     },
     "limit": {
-      "title": "Max videos",
+      "title": "Nombre maximum de vidéos",
       "type": "integer",
       "default": 3,
-      "description": "How many videos to download at most."
+      "minimum": 1,
+      "maximum": 50,
+      "description": "Combien de vidéos traiter au maximum (pour la recherche Top-N)."
     },
     "useApifyProxy": {
-      "title": "Use Apify Proxy",
+      "title": "Utiliser Apify Proxy",
       "type": "boolean",
       "default": true,
-      "description": "Enable or disable Apify proxy."
+      "description": "Active le proxy Apify pour réduire les blocages."
     },
     "apifyProxyGroups": {
-      "title": "Proxy groups",
+      "title": "Groupes de proxy (optionnel)",
       "type": "array",
       "items": { "type": "string" },
-      "description": "Optional list of proxy groups, e.g. [\"RESIDENTIAL\"]."
+      "description": "Ex.: [\"RESIDENTIAL\"] pour utiliser les proxys résidentiels."
     },
     "apifyProxyCountry": {
-      "title": "Proxy country",
+      "title": "Pays du proxy (optionnel)",
       "type": "string",
-      "description": "Two-letter country code for proxy geolocation, e.g. HK or SG."
+      "description": "Code pays ISO-2 (ex.: HK, SG, US) si disponible pour votre groupe proxy."
     },
     "saveBinary": {
-      "title": "Save MP4 to KV",
+      "title": "Enregistrer les MP4 dans le KV",
       "type": "boolean",
-      "default": true
+      "default": true,
+      "description": "Si vrai, sauvegarde le MP4 dans le Key-Value Store quand une URL .mp4 est trouvée."
     },
     "acceptM3U8": {
-      "title": "Accept m3u8 streams",
+      "title": "Accepter les flux m3u8",
       "type": "boolean",
-      "default": false
+      "default": false,
+      "description": "Si vrai, accepte aussi les URLs .m3u8 (stream HLS)."
     }
-  }
+  },
+  "required": []
 }
