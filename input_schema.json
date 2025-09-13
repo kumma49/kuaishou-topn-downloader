@@ -1,53 +1,50 @@
 {
-  "schemaVersion": 1,
-  "title": "Kuaishou Top-N Downloader",
+  "title": "Kuaishou TopN Downloader",
   "type": "object",
   "properties": {
     "keyword": {
-      "title": "Keyword (search)",
+      "title": "Search keyword",
       "type": "string",
-      "editor": "textfield",
-      "description": "Mot-clé Kuaishou pour trouver des vidéos (laisse vide si tu utilises urlList).",
-      "prefill": ""
+      "description": "Keyword to search on Kuaishou."
     },
     "urlList": {
-      "title": "Video page URLs (optional)",
+      "title": "Direct video URLs",
       "type": "array",
-      "editor": "stringList",
       "items": { "type": "string" },
-      "description": "Une URL Kuaishou par ligne (bypass la recherche par mot-clé)."
+      "description": "Optional list of Kuaishou video URLs."
     },
     "limit": {
-      "title": "How many videos to download (Top-N)",
+      "title": "Max videos",
       "type": "integer",
-      "editor": "number",
-      "description": "Nombre de vidéos à télécharger parmi les meilleurs résultats (1–50).",
-      "minimum": 1,
-      "maximum": 50,
-      "default": 3
+      "default": 3,
+      "description": "How many videos to download at most."
     },
     "useApifyProxy": {
       "title": "Use Apify Proxy",
       "type": "boolean",
-      "editor": "checkbox",
-      "description": "Active les proxys Apify pour réduire les blocages (recommandé).",
-      "default": true
+      "default": true,
+      "description": "Enable or disable Apify proxy."
+    },
+    "apifyProxyGroups": {
+      "title": "Proxy groups",
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "Optional list of proxy groups, e.g. [\"RESIDENTIAL\"]."
+    },
+    "apifyProxyCountry": {
+      "title": "Proxy country",
+      "type": "string",
+      "description": "Two-letter country code for proxy geolocation, e.g. HK or SG."
     },
     "saveBinary": {
-      "title": "Save MP4 to Key-Value Store",
+      "title": "Save MP4 to KV",
       "type": "boolean",
-      "editor": "checkbox",
-      "description": "Si activé et si un MP4 est trouvé, l’acteur l’enregistre dans le KV (téléchargeable via l’API).",
       "default": true
     },
     "acceptM3U8": {
-      "title": "Allow HLS (.m3u8) if MP4 not found (won't be downloaded)",
+      "title": "Accept m3u8 streams",
       "type": "boolean",
-      "editor": "checkbox",
-      "description": "Accepte une URL HLS .m3u8 quand pas de MP4; elle sera listée mais pas téléchargée.",
       "default": false
     }
-  },
-  "required": [],
-  "additionalProperties": false
+  }
 }
