@@ -7,7 +7,7 @@
       "title": "Keyword (search)",
       "type": "string",
       "editor": "textfield",
-      "description": "Mot-clé pour la recherche Kuaishou (laisse vide si tu utilises urlList).",
+      "description": "Mot-clé Kuaishou pour trouver des vidéos (laisse vide si tu utilises urlList).",
       "prefill": ""
     },
     "urlList": {
@@ -15,13 +15,13 @@
       "type": "array",
       "editor": "stringList",
       "items": { "type": "string" },
-      "description": "Une URL par ligne. Si fourni, la recherche par mot-clé est ignorée."
+      "description": "Une URL Kuaishou par ligne (bypass la recherche par mot-clé)."
     },
     "limit": {
       "title": "How many videos to download (Top-N)",
       "type": "integer",
       "editor": "number",
-      "description": "Nombre de vidéos à télécharger parmi les meilleurs résultats.",
+      "description": "Nombre de vidéos à télécharger parmi les meilleurs résultats (1–50).",
       "minimum": 1,
       "maximum": 50,
       "default": 3
@@ -30,20 +30,21 @@
       "title": "Use Apify Proxy",
       "type": "boolean",
       "editor": "checkbox",
+      "description": "Active les proxys Apify pour réduire les blocages (recommandé).",
       "default": true
     },
     "saveBinary": {
       "title": "Save MP4 to Key-Value Store",
       "type": "boolean",
       "editor": "checkbox",
-      "description": "Si activé et si un MP4 est trouvé, il est stocké dans le KV pour téléchargement via l’API.",
+      "description": "Si activé et si un MP4 est trouvé, l’acteur l’enregistre dans le KV (téléchargeable via l’API).",
       "default": true
     },
     "acceptM3U8": {
       "title": "Allow HLS (.m3u8) if MP4 not found (won't be downloaded)",
       "type": "boolean",
       "editor": "checkbox",
-      "description": "Accepte une URL .m3u8 quand pas de MP4 (elle ne sera pas téléchargée, juste exposée dans le Dataset).",
+      "description": "Accepte une URL HLS .m3u8 quand pas de MP4; elle sera listée mais pas téléchargée.",
       "default": false
     }
   },
