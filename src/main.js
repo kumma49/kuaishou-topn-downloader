@@ -1,15 +1,13 @@
-// === src/main.js (version finale) ===
+// === src/main.js (compatible Crawlee 3.14.x) ===
 import { Actor, KeyValueStore, Dataset } from 'apify';
 import { PlaywrightCrawler, ProxyConfiguration, log } from 'crawlee';
 
 // --- Helpers ---
-const UA_MOBILE =
-  'Mozilla/5.0 (iPhone; CPU iPhone OS 16_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.6 Mobile/15E148 Safari/604.1';
-
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const unique = (arr) => [...new Set(arr)];
 
 const parseCount = (txt = '') => {
+  // "1.2w" / "1.2万" => 12000 ; sinon nombre brut
   const w = txt.match(/([\d.,]+)\s*(w|万)/i);
   if (w) return Math.round(parseFloat(w[1].replace(',', '.')) * 10000);
   const n = txt.replace(/[^\d]/g, '');
@@ -24,7 +22,7 @@ const pickBestUrl = (arr, acceptM3U8) => {
   return null;
 };
 
-// Branche un sniffer réseau AVANT goto, et renvoie { bag, detach }
+// Branche un sniffer réseau AVANT la navigation
 const attachSniffer = (page) => {
   const bag = [];
   const seen = new Set();
@@ -47,7 +45,7 @@ const attachSniffer = (page) => {
   return { bag, detach };
 };
 
-// Tente d’extraire la vidéo depuis le DOM + ce qu’a sniffé le réseau
+// Essaie DOM + ce qu'a sniffé le réseau
 const extractVideoUrl = async (page, { acceptM3U8, preBag = [] }) => {
   const dom = await page.$$eval('video, source', (els) =>
     els.map((e) => e.src || e.getAttribute('src')).filter(Boolean),
@@ -83,7 +81,7 @@ const proxyConfiguration = useApifyProxy
 const kv = await KeyValueStore.open();
 const dataset = await Dataset.open();
 
-// Pages de départ: SEARCH (si keyword) + DETAIL (si urlList)
+// Pages de départ
 const startRequests = [];
 if (keyword) {
   startRequests.push({
@@ -105,19 +103,12 @@ const crawler = new PlaywrightCrawler({
   retryOnBlocked: true,
   maxRequestRetries: 2,
 
-  // UA/viewport mobile au niveau du context (correct Playwright)
-  launchContext: {
-    contextOptions: {
-      userAgent: UA_MOBILE,
-      viewport: { width: 390, height: 844 },
-      isMobile: true,
-      hasTouch: true,
-      deviceScaleFactor: 3,
-    },
-  },
-
+  // Pas de userAgent ici (incompatible avec ta version). On ne règle que le viewport.
   preNavigationHooks: [
-    async () => {
+    async ({ page }) => {
+      try {
+        await page.setViewportSize({ width: 390, height: 844 }); // "mobile-ish"
+      } catch {}
       await sleep(300 + Math.floor(Math.random() * 400));
     },
   ],
@@ -126,20 +117,15 @@ const crawler = new PlaywrightCrawler({
     const { label } = request.userData || {};
     log.info(`Open: [${label || 'DETAIL'}] ${request.url}`);
 
-    // 👉 Sniffer AVANT la navigation
+    // Sniffer AVANT la navigation
     const sniffer = attachSniffer(page);
-
     await page.goto(request.url, { waitUntil: 'networkidle' });
 
     if (label === 'SEARCH') {
       await autoScroll(page, 5);
 
       const cards = await page.$$eval('a[href*="/short-video/"]', (as) =>
-        as.map((a) => {
-          const text = a.innerText || '';
-          const href = a.href;
-          return { href, text };
-        }),
+        as.map((a) => ({ href: a.href, text: a.innerText || '' })),
       );
 
       const dedup = [...new Map(cards.map((c) => [c.href, c])).values()];
@@ -162,7 +148,6 @@ const crawler = new PlaywrightCrawler({
         });
         rank++;
       }
-
       sniffer.detach();
       return;
     }
@@ -194,7 +179,6 @@ const crawler = new PlaywrightCrawler({
       }
     }
 
-    // Exploration limitée
     await enqueueLinks({
       strategy: 'same-domain',
       globs: ['https://www.kuaishou.com/short-video/**', 'https://www.kuaishou.com/search/video?*'],
