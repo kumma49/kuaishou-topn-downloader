@@ -1,7 +1,0 @@
-kuaishou-topn-downloader/
-├─ actor.json
-├─ package.json
-├─ Dockerfile
-├─ input_schema.json
-└─ src/
-   └─ main.js
