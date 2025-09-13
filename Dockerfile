@@ -1,19 +1,24 @@
-# Node 20 pour compatibilité des deps
+# Node 20 + Playwright (base Apify)
 FROM apify/actor-node-playwright:20
 
-# Dossier de travail
+# 1) Passe en root pour l'installation
+USER root
+
+# 2) Dossier de travail
 WORKDIR /usr/src/app
 
-# Copie des manifests
-COPY package*.json ./
+# 3) Assure les droits sur le workdir (par précaution)
+RUN mkdir -p /usr/src/app && chown -R root:root /usr/src/app
 
-# Installe les deps en root (évite les soucis de permissions)
+# 4) Copie les manifests et installe les deps EN ROOT
+COPY package*.json ./
 RUN npm install --omit=dev --no-audit --no-fund
 
-# Copie le reste du code
+# 5) Copie le reste du code
 COPY . ./
 
-# Exécute l'actor en utilisateur non-root
+# 6) Reviens à l'utilisateur non-root pour l'exécution
 USER myuser
 
+# 7) Lancement de l'actor
 CMD ["npm","start"]
