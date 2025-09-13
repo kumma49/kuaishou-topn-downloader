@@ -49,7 +49,7 @@ const extractVideoUrl = async (page, { acceptM3U8, preBag = [] }) => {
 // auto-scroll
 const autoScroll = async (page, steps = 6) => {
   for (let i = 0; i < steps; i++) {
-    await page.mouse.wheel(0, 1400);
+    try { await page.mouse.wheel(0, 1400); } catch {}
     await sleep(600 + Math.floor(Math.random() * 500));
   }
 };
@@ -139,6 +139,15 @@ const crawler = new PlaywrightCrawler({
     try { await page.waitForSelector('body', { timeout: 15000 }); } catch {}
 
     if (label === 'SEARCH') {
+      // ⤵️ clique l'onglet "视频" (Vidéo) si présent
+      try {
+        const tabVideo = page.locator('text=视频');
+        if (await tabVideo.count()) {
+          await tabVideo.first().click();
+          await page.waitForTimeout(1200);
+        }
+      } catch {}
+
       // attendre qu’au moins un sélecteur plausible apparaisse
       const anySelector = [
         'a[href*="/short-video/"]',
@@ -149,19 +158,31 @@ const crawler = new PlaywrightCrawler({
 
       await autoScroll(page, 7);
 
-      // récupère TOUS les liens et filtre '/short-video/'
-      const hrefs = await page.$$eval('a[href]', (as) => as.map(a => a.href));
+      // 1) DOM standard
+      let hrefs = await page.$$eval('a[href]', (as) => as.map(a => a.href));
+
+      // 2) Fallback: parse HTML si le DOM ne montre rien (CSR/hydratation lente)
+      if (!hrefs || hrefs.length < 5) {
+        try {
+          const html = await page.content();
+          const viaRegex = html.match(/https:\/\/www\.kuaishou\.com\/(?:short-video|f)\/[A-Za-z0-9_-]+/g) || [];
+          hrefs = [...new Set([...(hrefs || []), ...viaRegex])];
+        } catch {}
+      }
+
       const videoLinks = unique(
-        hrefs.filter(h => /\/short-video\/|\/f\//i.test(h))
+        (hrefs || []).filter(h => /\/short-video\/|\/f\//i.test(h))
       );
 
       if (!videoLinks.length) {
-        // debug: screenshot + html partiel
+        // debug: screenshot + html
         try {
           const buf = await page.screenshot({ fullPage: true });
           await kv.setValue(`DEBUG_SEARCH_${Date.now()}.png`, buf, { contentType: 'image/png' });
+          const html = await page.content();
+          await kv.setValue(`DEBUG_SEARCH_${Date.now()}.html`, html, { contentType: 'text/html; charset=utf-8' });
         } catch {}
-        log.warning('SEARCH: aucun lien vidéo détecté après scroll.');
+        log.warning('SEARCH: aucun lien vidéo détecté après scroll (même via regex).');
         sniffer.detach();
         return;
       }
@@ -233,16 +254,8 @@ const crawler = new PlaywrightCrawler({
       }
     }
 
-    // exploration limitée
-    await enqueueLinks({
-      strategy: 'same-domain',
-      globs: [
-        'https://www.kuaishou.com/short-video/**',
-        'https://www.kuaishou.com/search/video?*',
-        'https://www.kuaishou.com/f/**',
-      ],
-      maxRequestsPerCrawl: 20,
-    });
+    // (pas d'enqueueLinks ici pour éviter les erreurs et les re-téléchargements)
+    return;
   },
 
   failedRequestHandler({ request }) {
