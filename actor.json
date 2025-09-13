@@ -1,0 +1,9 @@
+{
+  "actorSpecification": 1,
+  "name": "kuaishou-topn-downloader",
+  "title": "Kuaishou Top-N Downloader",
+  "description": "Search Kuaishou by keyword, rank by like count, download top N videos, store MP4s to KV.",
+  "version": "0.1",
+  "dockerfile": "./Dockerfile",
+  "input": "./input_schema.json"
+}
