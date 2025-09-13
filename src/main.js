@@ -1,4 +1,4 @@
-// === src/main.js (corrigé) ===
+// === src/main.js (version finale) ===
 import { Actor, KeyValueStore, Dataset } from 'apify';
 import { PlaywrightCrawler, ProxyConfiguration, log } from 'crawlee';
 
@@ -7,16 +7,14 @@ const UA_MOBILE =
   'Mozilla/5.0 (iPhone; CPU iPhone OS 16_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.6 Mobile/15E148 Safari/604.1';
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const unique = (arr) => [...new Set(arr)];
 
 const parseCount = (txt = '') => {
-  // "1.2w" or "1.2万" => 12000 ; otherwise plain number
   const w = txt.match(/([\d.,]+)\s*(w|万)/i);
   if (w) return Math.round(parseFloat(w[1].replace(',', '.')) * 10000);
   const n = txt.replace(/[^\d]/g, '');
   return n ? parseInt(n, 10) : 0;
 };
-
-const unique = (arr) => [...new Set(arr)];
 
 const pickBestUrl = (arr, acceptM3U8) => {
   if (!arr || !arr.length) return null;
@@ -26,32 +24,39 @@ const pickBestUrl = (arr, acceptM3U8) => {
   return null;
 };
 
-// --- Extraction depuis une page vidéo ---
-const extractVideoUrl = async (page, { acceptM3U8 }) => {
-  // 1) DOM direct
-  const dom = await page.$$eval('video, source', (els) =>
-    els.map((e) => e.src || e.getAttribute('src')).filter(Boolean)
-  );
-  let candidate = pickBestUrl(unique(dom), acceptM3U8);
-  if (candidate) return candidate;
-
-  // 2) Sniff réseau (listener déjà posé dans le handler avant navigation)
+// Branche un sniffer réseau AVANT goto, et renvoie { bag, detach }
+const attachSniffer = (page) => {
   const bag = [];
   const seen = new Set();
-  page.on('response', (resp) => {
+  const listener = (resp) => {
     try {
       const u = resp.url();
-      if (/\.(mp4|m3u8)(\?|$)/i.test(u) || (/play|video|stream/i.test(u) && u.startsWith('http'))) {
-        if (!seen.has(u)) { seen.add(u); bag.push(u); }
+      if (
+        /\.(mp4|m3u8)(\?|$)/i.test(u) ||
+        (/play|video|stream/i.test(u) && u.startsWith('http'))
+      ) {
+        if (!seen.has(u)) {
+          seen.add(u);
+          bag.push(u);
+        }
       }
     } catch {}
-  });
-  await sleep(1500);
-  candidate = pickBestUrl(unique(bag), acceptM3U8);
-  return candidate;
+  };
+  page.on('response', listener);
+  const detach = () => page.off('response', listener);
+  return { bag, detach };
 };
 
-// --- Auto-scroll pour charger plus de cartes en recherche ---
+// Tente d’extraire la vidéo depuis le DOM + ce qu’a sniffé le réseau
+const extractVideoUrl = async (page, { acceptM3U8, preBag = [] }) => {
+  const dom = await page.$$eval('video, source', (els) =>
+    els.map((e) => e.src || e.getAttribute('src')).filter(Boolean),
+  );
+  const merged = unique([...dom, ...preBag]);
+  return pickBestUrl(merged, acceptM3U8);
+};
+
+// Auto-scroll pour charger plus de cartes en recherche
 const autoScroll = async (page, steps = 4) => {
   for (let i = 0; i < steps; i++) {
     await page.mouse.wheel(0, 1200);
@@ -100,7 +105,7 @@ const crawler = new PlaywrightCrawler({
   retryOnBlocked: true,
   maxRequestRetries: 2,
 
-  // ✅ Définir l'UA/viewport mobile au niveau du context (correct pour Playwright)
+  // UA/viewport mobile au niveau du context (correct Playwright)
   launchContext: {
     contextOptions: {
       userAgent: UA_MOBILE,
@@ -111,7 +116,6 @@ const crawler = new PlaywrightCrawler({
     },
   },
 
-  // (Garde juste un délai léger anti-pattern si tu veux)
   preNavigationHooks: [
     async () => {
       await sleep(300 + Math.floor(Math.random() * 400));
@@ -122,9 +126,11 @@ const crawler = new PlaywrightCrawler({
     const { label } = request.userData || {};
     log.info(`Open: [${label || 'DETAIL'}] ${request.url}`);
 
+    // 👉 Sniffer AVANT la navigation
+    const sniffer = attachSniffer(page);
+
     await page.goto(request.url, { waitUntil: 'networkidle' });
 
-    // === SEARCH: récupérer cartes, scorer, enqueuer Top-N vers DETAIL ===
     if (label === 'SEARCH') {
       await autoScroll(page, 5);
 
@@ -133,7 +139,7 @@ const crawler = new PlaywrightCrawler({
           const text = a.innerText || '';
           const href = a.href;
           return { href, text };
-        })
+        }),
       );
 
       const dedup = [...new Map(cards.map((c) => [c.href, c])).values()];
@@ -141,7 +147,6 @@ const crawler = new PlaywrightCrawler({
         url: c.href,
         likes: (c.text && c.text.match(/[\d.,]+\s*(?:w|万)|\d+/i)) ? c.text : '',
       }));
-
       for (const s of scored) s.likeCount = parseCount(s.likes);
 
       const top = scored
@@ -157,13 +162,16 @@ const crawler = new PlaywrightCrawler({
         });
         rank++;
       }
+
+      sniffer.detach();
       return;
     }
 
-    // === DETAIL: extraire videoUrl + (optionnel) sauvegarder MP4 dans KV ===
-    const videoUrl = await extractVideoUrl(page, { acceptM3U8 });
-    const title = await page.title().catch(() => '');
+    // DETAIL
+    const videoUrl = await extractVideoUrl(page, { acceptM3U8, preBag: sniffer.bag });
+    sniffer.detach();
 
+    const title = await page.title().catch(() => '');
     const item = {
       pageUrl: request.url,
       title,
@@ -186,7 +194,7 @@ const crawler = new PlaywrightCrawler({
       }
     }
 
-    // Limite l'exploration – ne reste que sur les pages pertinentes
+    // Exploration limitée
     await enqueueLinks({
       strategy: 'same-domain',
       globs: ['https://www.kuaishou.com/short-video/**', 'https://www.kuaishou.com/search/video?*'],
@@ -202,7 +210,7 @@ const crawler = new PlaywrightCrawler({
 await crawler.run(
   startRequests.length
     ? startRequests
-    : [{ url: 'https://www.kuaishou.com', userData: { label: 'SEARCH' } }]
+    : [{ url: 'https://www.kuaishou.com', userData: { label: 'SEARCH' } }],
 );
 
 await Actor.exit();
