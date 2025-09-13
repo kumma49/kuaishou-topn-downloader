@@ -1,6 +1,7 @@
-// === src/main.js (search durcie: 404 détectée, saisie manuelle, SERP multi requêtes EN+CN) ===
+// === src/main.js (Kuaishou crawler + fallback Google CSE) ===
 import { Actor, KeyValueStore, Dataset } from 'apify';
 import { PlaywrightCrawler, ProxyConfiguration, log } from 'crawlee';
+import fetch from 'node-fetch';
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const unique = (arr) => [...new Set(arr)];
@@ -8,22 +9,30 @@ const unique = (arr) => [...new Set(arr)];
 const UA_MOBILE =
   'Mozilla/5.0 (iPhone; CPU iPhone OS 16_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.6 Mobile/15E148 Safari/604.1';
 
-const parseCount = (txt = '') => {
-  const w = txt.match(/([\d.,]+)\s*(w|万)/i);
-  if (w) return Math.round(parseFloat(w[1].replace(',', '.')) * 10000);
-  const n = txt.replace(/[^\d]/g, '');
-  return n ? parseInt(n, 10) : 0;
-};
+const GOOGLE_API_KEY = process.env.GOOGLE_API_KEY;
+const GOOGLE_CSE_ID = process.env.GOOGLE_CSE_ID;
 
-const pickBestUrl = (arr, acceptM3U8) => {
-  if (!arr || !arr.length) return null;
-  const mp4 = arr.find((u) => /\.mp4(\?|$)/i.test(u));
-  if (mp4) return mp4;
-  if (acceptM3U8) return arr.find((u) => /\.m3u8(\?|$)/i.test(u)) || null;
-  return null;
-};
+// -------- Google SERP Fallback (Custom Search API) ----------
+async function serpGoogleBatch(query) {
+  if (!GOOGLE_API_KEY || !GOOGLE_CSE_ID) {
+    log.warning("Google API key ou CSE ID manquant → configure GOOGLE_API_KEY et GOOGLE_CSE_ID !");
+    return [];
+  }
+  const url = `https://www.googleapis.com/customsearch/v1?q=${encodeURIComponent(query)}&cx=${GOOGLE_CSE_ID}&key=${GOOGLE_API_KEY}&num=10`;
+  try {
+    const res = await fetch(url);
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const data = await res.json();
+    const urls = (data.items || [])
+      .map((it) => it?.link)
+      .filter((u) => typeof u === 'string' && /kuaishou\.com\/(short-video|f)\//i.test(u));
+    return unique(urls);
+  } catch (e) {
+    log.error(`SERP Google API error: ${e.message}`);
+    return [];
+  }
+}
 
-// --- Sniffer réseau (mp4/m3u8) ---
 const attachSniffer = (page) => {
   const bag = [];
   const seen = new Set();
@@ -40,15 +49,14 @@ const attachSniffer = (page) => {
   return { bag, detach };
 };
 
-const extractVideoUrl = async (page, { acceptM3U8, preBag = [] }) => {
+const extractVideoUrl = async (page, { preBag = [] }) => {
   const dom = await page.$$eval('video, source', (els) =>
     els.map((e) => e.src || e.getAttribute('src')).filter(Boolean),
   );
-  const merged = unique([...dom, ...preBag]);
-  return pickBestUrl(merged, acceptM3U8);
+  return unique([...dom, ...preBag])[0] || null;
 };
 
-const autoScroll = async (page, steps = 7) => {
+const autoScroll = async (page, steps = 6) => {
   for (let i = 0; i < steps; i++) {
     try { await page.mouse.wheel(0, 1400); } catch {}
     await sleep(600 + Math.floor(Math.random() * 500));
@@ -57,183 +65,45 @@ const autoScroll = async (page, steps = 7) => {
 
 const gotoRobust = async (page, url) => {
   try {
-    await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 90000 });
-  } catch (e) {
-    log.warning(`goto(domcontentloaded) failed: ${e.message}`);
-    await page.goto(url, { waitUntil: 'load', timeout: 90000 });
-  }
-};
-
-// --- DEBUG: screenshot + HTML vers KV ---
-const saveDebug = async (page, prefix = 'DEBUG') => {
-  try {
-    const store = await KeyValueStore.open();
-    const png = await page.screenshot({ fullPage: true });
-    const html = await page.content();
-    const ts = Date.now();
-    await store.setValue(`${prefix}_${ts}.png`, png, { contentType: 'image/png' });
-    await store.setValue(`${prefix}_${ts}.html`, html, { contentType: 'text/html; charset=utf-8' });
-    log.info(`${prefix}: artefacts sauvegardés dans KV (png + html)`);
-  } catch (e) {
-    log.warning(`${prefix}: échec sauvegarde debug -> ${e?.message || e}`);
-  }
-};
-
-// --- Vérifie la 404/“page inexistante” chinoise ---
-const isCn404 = async (page) => {
-  try {
-    const txt = (await page.content()) || '';
-    return /页面不存在|回首页|404/i.test(txt);
-  } catch { return false; }
-};
-
-// --- Recherche manuelle: ouvre la home, tape le mot-clé, Enter ---
-const manualSearchFlow = async (page, keyword) => {
-  try {
-    // On passe par la home (www + m.)
-    const homes = ['https://www.kuaishou.com/', 'https://m.kuaishou.com/'];
-    for (const home of homes) {
-      try {
-        await gotoRobust(page, home);
-        // Essaye plusieurs inputs
-        const selectors = [
-          'input[type="search"]',
-          'input[placeholder*="搜索"]',
-          'input[placeholder*="Search"]',
-          'input',
-        ];
-        let found = false;
-        for (const sel of selectors) {
-          const loc = page.locator(sel);
-          if (await loc.count()) {
-            await loc.first().click({ delay: 50 }).catch(() => {});
-            await loc.first().fill(keyword).catch(() => {});
-            await page.keyboard.press('Enter').catch(() => {});
-            await page.waitForTimeout(1500);
-            found = true;
-            break;
-          }
-        }
-        if (found) {
-          // Attends une page résultat ou une URL qui contient “search”
-          try { await page.waitForURL(/search|short-video|video/i, { timeout: 10000 }); } catch {}
-          return true;
-        }
-      } catch (e) {
-        log.warning(`manualSearchFlow(${home}) -> ${e?.message || e}`);
-      }
-    }
-    return false;
+    await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 60000 });
   } catch {
-    return false;
+    await page.goto(url, { waitUntil: 'networkidle', timeout: 60000 });
   }
 };
 
-// --- SERP (Google UNIQUEMENT), multi requêtes EN+CN ---
-const serpGoogleBatch = async (queries) => {
-  const all = [];
-  for (const q of queries) {
-    try {
-      log.info(`SERP(Google): ${q}`);
-      const run = await Actor.call('apify/google-search-scraper', {
-        queries: q,                 // IMPORTANT: string, pas array
-        resultsPerPage: 25,
-        maxPagesPerQuery: 1,
-        mobileResults: true,
-        saveHtml: false,
-      });
-      const out = await Actor.openDataset(run.defaultDatasetId);
-      const { items } = await out.getData({ limit: 200 });
-      const urls = (items || [])
-        .map((it) => it?.url)
-        .filter((u) => typeof u === 'string' && /kuaishou\.com\/(short-video|f)\//i.test(u));
-      all.push(...urls);
-    } catch (e) {
-      log.warning(`SERP(Google) error on "${q}": ${e?.message || e}`);
-    }
-  }
-  return unique(all);
-};
-
-// --- Petites traductions/synonymes simplifiés EN→CN (basique mais utile) ---
-const expandQueries = (keyword) => {
-  // Ajoute quelques variantes CN si l’input est EN
-  const cnHints = [
-    `${keyword} 视频`,           // “video”
-    `搞笑 ${keyword}`,          // “funny”
-    `${keyword} 搞笑`,
-  ];
-  // Si keyword est déjà CN, ajoute quelques variantes
-  const isCN = /[\u4e00-\u9fff]/.test(keyword);
-  const base = [
-    `site:kuaishou.com/short-video ${keyword}`,
-  ];
-  if (isCN) {
-    base.push(
-      `site:kuaishou.com/short-video ${keyword} 搞笑`,
-      `site:kuaishou.com/short-video ${keyword} 视频`
-    );
-  } else {
-    base.push(
-      `site:kuaishou.com/short-video ${keyword} funny`,
-      `site:kuaishou.com/short-video funny ${keyword}`,
-      ...cnHints.map((h) => `site:kuaishou.com/short-video ${h}`),
-    );
-  }
-  return unique(base);
-};
-
-// ========== MAIN ==========
 await Actor.init();
-
 const input = (await Actor.getInput()) || {};
 const {
   keyword,
   urlList = [],
   limit = 3,
   useApifyProxy = true,
-  saveBinary = true,
-  acceptM3U8 = false,
-  apifyProxyGroups,
-  apifyProxyCountry,
-  useSerpFallback = true,
 } = input;
 
 const proxyConfiguration = useApifyProxy
-  ? await Actor.createProxyConfiguration({
-      groups: Array.isArray(apifyProxyGroups) ? apifyProxyGroups : undefined,
-      countryCode: apifyProxyCountry || undefined,
-    })
+  ? await Actor.createProxyConfiguration()
   : new ProxyConfiguration();
 
 const kv = await KeyValueStore.open();
 const dataset = await Dataset.open();
 
-// Seeds: m-dot + www pour SEARCH, + détails fournis
+// start URLs
 const startRequests = [];
 if (keyword) {
   startRequests.push({
     url: `https://m.kuaishou.com/search/video?keyword=${encodeURIComponent(keyword)}`,
-    userData: { label: 'SEARCH', origin: 'm', keyword },
-  });
-  startRequests.push({
-    url: `https://www.kuaishou.com/search/video?keyword=${encodeURIComponent(keyword)}`,
-    userData: { label: 'SEARCH', origin: 'www', keyword },
+    userData: { label: 'SEARCH' },
   });
 }
 for (const u of urlList) {
-  startRequests.push({ url: u, userData: { label: 'DETAIL', likes: 0, rank: null } });
+  startRequests.push({ url: u, userData: { label: 'DETAIL' } });
 }
 
 const crawler = new PlaywrightCrawler({
   proxyConfiguration,
   headless: true,
   maxConcurrency: 2,
-  requestHandlerTimeoutSecs: 160,
-  useSessionPool: true,
-  persistCookiesPerSession: true,
-  retryOnBlocked: true,
-  maxRequestRetries: 2,
+  requestHandlerTimeoutSecs: 120,
 
   preNavigationHooks: [
     async ({ page }) => {
@@ -245,165 +115,51 @@ const crawler = new PlaywrightCrawler({
         }, UA_MOBILE);
       } catch {}
       try { await page.setViewportSize({ width: 390, height: 844 }); } catch {}
-      try {
-        await page.setExtraHTTPHeaders({
-          'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
-          'Upgrade-Insecure-Requests': '1',
-          'Referer': 'https://www.kuaishou.com/',
-        });
-      } catch {}
-      await sleep(250 + Math.floor(Math.random() * 400));
     },
   ],
 
   async requestHandler({ request, page, enqueueLinks, log }) {
-    const { label, keyword: kw } = request.userData || {};
-    log.info(`Open: [${label || 'DETAIL'}] ${request.url}`);
+    const { label } = request.userData || {};
+    log.info(`Open: [${label}] ${request.url}`);
 
     const sniffer = attachSniffer(page);
     await gotoRobust(page, request.url);
 
-    // Redirections /f/ → /short-video/
-    try { await page.waitForURL(/short-video|video/i, { timeout: 15000 }); } catch {}
-
-    const currentUrl = page.url();
-    try { await page.waitForSelector('body', { timeout: 15000 }); } catch {}
-
     if (label === 'SEARCH') {
-      // Si page 404 chinoise → recherche manuelle depuis la home
-      if (await isCn404(page)) {
-        log.info('SEARCH: page 404 CN détectée → tentative de recherche manuelle via home.');
-        const ok = await manualSearchFlow(page, kw);
-        if (!ok) log.warning('SEARCH: recherche manuelle non concluante.');
+      await autoScroll(page, 6);
+      let hrefs = await page.$$eval('a[href]', (as) => as.map(a => a.href));
+      hrefs = hrefs.filter((h) => /\/short-video\/|\/f\//i.test(h));
+
+      // fallback SERP si rien
+      if (!hrefs.length && keyword) {
+        log.info("Fallback Google CSE...");
+        hrefs = await serpGoogleBatch(`site:kuaishou.com/short-video ${keyword}`);
       }
 
-      // Clique l’onglet “视频” si présent
-      try {
-        const tabVideo = page.locator('text=视频');
-        if (await tabVideo.count()) {
-          await tabVideo.first().click();
-          await page.waitForTimeout(1200);
-        }
-      } catch {}
-
-      // Attends quelques sélecteurs “plausibles”
-      const anySelector = [
-        'a[href*="/short-video/"]',
-        'a[href*="/f/"]',
-        'div[data-e2e*="card"] a[href]',
-        'section a[href*="/short-video/"]',
-        'div:has(video) a[href*="/short-video/"]',
-      ].join(',');
-      try { await page.waitForSelector(anySelector, { timeout: 20000 }); } catch {}
-
-      await autoScroll(page, 7);
-
-      // DOM → hrefs
-      let hrefs = await page.$$eval('a[href]', (as) => as.map((a) => a.href));
-
-      // Fallback regex HTML si DOM pauvre
-      if (!hrefs || hrefs.length < 5) {
-        try {
-          const html = await page.content();
-          const viaRegex = html.match(/https:\/\/www\.kuaishou\.com\/(?:short-video|f)\/[A-Za-z0-9_-]+/g) || [];
-          hrefs = [...new Set([...(hrefs || []), ...viaRegex])];
-        } catch {}
-      }
-
-      let videoLinks = unique((hrefs || []).filter((h) => /\/short-video\/|\/f\//i.test(h)));
-
-      // SERP Google batch (EN + CN variations) si rien
-      if ((!videoLinks.length) && useSerpFallback && kw) {
-        const queries = expandQueries(kw);
-        const serpUrls = await serpGoogleBatch(queries);
-        videoLinks = serpUrls.slice(0, Math.max(1, Math.min(limit, 50)));
-      }
-
-      if (!videoLinks.length) {
-        await saveDebug(page, 'DEBUG_SEARCH');
-        log.warning('SEARCH: aucun lien vidéo détecté (voir DEBUG_SEARCH_* dans KV).');
+      if (!hrefs.length) {
+        const buf = await page.screenshot({ fullPage: true });
+        await kv.setValue(`DEBUG_SEARCH_${Date.now()}.png`, buf, { contentType: 'image/png' });
+        log.warning("SEARCH: aucun lien trouvé !");
         sniffer.detach();
         return;
       }
 
-      // “scoring” likes basique
-      const cardsScored = await page.evaluate((links) => {
-        const around = (u) => {
-          const a = [...document.querySelectorAll('a[href]')].find((x) => x.href === u);
-          if (!a) return '';
-          const t = a.innerText || '';
-          const p = a.closest('article,section,div')?.innerText || '';
-          return `${t}\n${p}`.slice(0, 600);
-        };
-        return links.map((u) => ({ url: u, context: around(u) }));
-      }, videoLinks).catch(() => videoLinks.map((u) => ({ url: u, context: '' })));
-
-      for (const c of cardsScored) {
-        const m = c.context.match(/([\d.,]+\s*(?:w|万)|\d+)/i);
-        c.likeCount = m ? (() => {
-          const m2 = m[0];
-          const w = m2.match(/([\d.,]+)\s*(w|万)/i);
-          if (w) return Math.round(parseFloat(w[1].replace(',', '.')) * 10000);
-          const n = m2.replace(/[^\d]/g, '');
-          return n ? parseInt(n, 10) : 0;
-        })() : 0;
-      }
-
-      const top = cardsScored
-        .sort((a, b) => (b.likeCount || 0) - (a.likeCount || 0))
-        .slice(0, Math.max(1, Math.min(limit, 50)));
-
-      let rank = 1;
-      for (const t of top) {
-        await enqueueLinks({
-          urls: [t.url],
-          userData: { label: 'DETAIL', likes: t.likeCount || 0, rank },
-          forefront: true,
-        });
-        rank++;
+      const top = hrefs.slice(0, limit);
+      for (const u of top) {
+        await enqueueLinks({ urls: [u], userData: { label: 'DETAIL' }, forefront: true });
       }
       sniffer.detach();
       return;
     }
 
-    // === DETAIL ===
-    const videoUrl = await extractVideoUrl(page, { acceptM3U8, preBag: sniffer.bag });
-    if (!videoUrl) await saveDebug(page, 'DEBUG_DETAIL');
+    // DETAIL
+    const videoUrl = await extractVideoUrl(page, { preBag: sniffer.bag });
     sniffer.detach();
 
-    const title = await page.title().catch(() => '');
-    const item = {
-      pageUrl: currentUrl,
-      title,
-      videoUrl: videoUrl || null,
-      likes: request.userData?.likes ?? null,
-      rank: request.userData?.rank ?? null,
-    };
-    await dataset.pushData(item);
-
-    if (saveBinary && videoUrl && /\.mp4(\?|$)/i.test(videoUrl)) {
-      try {
-        const res = await fetch(videoUrl);
-        const buf = Buffer.from(await res.arrayBuffer());
-        const key = `VIDEO_${Date.now()}${item.rank ? `_r${item.rank}` : ''}.mp4`;
-        await kv.setValue(key, buf, { contentType: 'video/mp4' });
-        await Actor.setValue(`META_${key.replace('.mp4', '')}.json`, { ...item, kvKey: key });
-        log.info(`Saved MP4 to KV: ${key}`);
-      } catch (e) {
-        log.warning(`Download failed: ${e?.message || e}`);
-      }
-    }
-  },
-
-  failedRequestHandler({ request }) {
-    log.error(`Failed: ${request.url}`);
+    await dataset.pushData({ pageUrl: page.url(), videoUrl });
+    if (videoUrl) log.info(`Video trouvée: ${videoUrl}`);
   },
 });
 
-await crawler.run(
-  startRequests.length
-    ? startRequests
-    : [{ url: 'https://m.kuaishou.com/', userData: { label: 'SEARCH', keyword: '搞笑 狗' } }],
-);
-
+await crawler.run(startRequests);
 await Actor.exit();
