@@ -1,5 +1,5 @@
 // === src/main.js ===
-// Kuaishou search robuste (www + m-dot + SERP fallback) + capture MP4 dans le Key-Value Store
+// Kuaishou Top-N downloader : search robuste (www + m-dot + SERP Google/Bing/DDG) + capture MP4 dans KV
 
 import { Actor, KeyValueStore, Dataset } from 'apify';
 import { PlaywrightCrawler, ProxyConfiguration, log } from 'crawlee';
@@ -43,22 +43,30 @@ const attachSniffer = (page) => {
 };
 
 const extractVideoUrl = async (page, { acceptM3U8, preBag = [] }) => {
+  // 1) DOM direct
   const dom = await page.$$eval('video, source', (els) =>
     els.map((e) => e.src || e.getAttribute('src')).filter(Boolean),
   );
-  const merged = unique([...dom, ...preBag]);
+  // 2) JSON/HTML heuristics (parfois l’URL apparaît dans le HTML)
+  let htmlUrls = [];
+  try {
+    const html = await page.content();
+    const m = html.match(/https?:\/\/[^"' ]+\.(?:mp4|m3u8)(?:\?[^"' ]*)?/gi);
+    if (m) htmlUrls = m;
+  } catch {}
+  const merged = unique([...(dom || []), ...(preBag || []), ...htmlUrls]);
   return pickBestUrl(merged, acceptM3U8);
 };
 
-// Scroll JS + récolte incrémentale des <a href>
+// Scroll + récolte incrémentale des <a href>
 const incrementalScrollAndHarvest = async (page, steps = 7) => {
   const harvested = new Set();
   for (let i = 0; i < steps; i++) {
     await page.evaluate(async () => {
-      window.scrollBy(0, 1200);
-      await new Promise(r => setTimeout(r, 600));
+      window.scrollBy(0, 1400);
+      await new Promise(r => setTimeout(r, 650));
     });
-    await sleep(600 + Math.floor(Math.random() * 500));
+    await sleep(550 + Math.floor(Math.random() * 450));
     try {
       const hrefs = await page.$$eval('a[href]', (as) => as.map(a => a.href));
       hrefs.forEach(h => harvested.add(h));
@@ -67,18 +75,18 @@ const incrementalScrollAndHarvest = async (page, steps = 7) => {
   return [...harvested];
 };
 
-// Nav “robuste” si tu veux forcer manuellement (non obligatoire ici)
+// Nav robuste
 const gotoRobust = async (page, url) => {
   try {
     await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 60000 });
   } catch (e) {
     log.warning(`goto domcontentloaded failed: ${e.message}`);
-    await page.goto(url, { waitUntil: 'networkidle', timeout: 60000 });
+    await page.goto(url, { waitUntil: 'networkidle', timeout: 90000 });
   }
 };
 
-// Sauvegarde debug (screenshot + HTML) dans KV (pas sur disque)
-let kv; // initialisé après Actor.init()
+// KV (set après init)
+let kv;
 const saveDebug = async (page, prefix = 'DEBUG') => {
   try {
     const png = await page.screenshot({ fullPage: true });
@@ -92,38 +100,68 @@ const saveDebug = async (page, prefix = 'DEBUG') => {
   }
 };
 
-// Fallback SERP: retourne des URLs /short-video ou /f via l’actor Google
-const serpSearch = async (keyword) => {
-  if (!keyword) return [];
+// ------ SERP providers (Google, Bing, DuckDuckGo) ------
+const serpSearchGoogle = async (keyword) => {
   const query = `site:kuaishou.com/short-video ${keyword}`;
-  log.info(`SERP fallback query: ${query}`);
-
-  // IMPORTANT: "queries" doit être un STRING (pas un tableau)
+  log.info(`SERP(Google): ${query}`);
   const run = await Actor.call('apify/google-search-scraper', {
-    queries: query,
+    queries: query, // IMPORTANT: string, pas tableau
     resultsPerPage: 25,
     maxPagesPerQuery: 1,
     mobileResults: true,
     saveHtml: false,
   });
+  const dsId = run?.defaultDatasetId || run?.output?.defaultDatasetId || run?.datasetId;
+  if (!dsId) return [];
+  const ds = await Actor.openDataset(dsId);
+  const { items } = await ds.getData({ limit: 200 });
+  return (items || []).map(i => i?.url).filter(u => /kuaishou\.com\/(short-video|f)\//i.test(u));
+};
 
-  const serpDatasetId =
-    run?.defaultDatasetId ||
-    run?.output?.defaultDatasetId ||
-    run?.datasetId;
+const serpSearchBing = async (keyword) => {
+  const query = `site:kuaishou.com/short-video ${keyword}`;
+  log.info(`SERP(Bing): ${query}`);
+  const run = await Actor.call('apify/bing-search-scraper', {
+    query, // ce scraper prend "query"
+    maxPagesPerQuery: 1,
+    countryCode: 'HK',
+    useMobileVersion: true,
+  });
+  const dsId = run?.defaultDatasetId || run?.output?.defaultDatasetId || run?.datasetId;
+  if (!dsId) return [];
+  const ds = await Actor.openDataset(dsId);
+  const { items } = await ds.getData({ limit: 200 });
+  return (items || []).map(i => i?.url).filter(u => /kuaishou\.com\/(short-video|f)\//i.test(u));
+};
 
-  if (!serpDatasetId) {
-    log.warning('SERP: pas de datasetId retourné par google-search-scraper.');
-    return [];
-  }
+const serpSearchDDG = async (keyword) => {
+  const query = `site:kuaishou.com/short-video ${keyword}`;
+  log.info(`SERP(DDG): ${query}`);
+  const run = await Actor.call('apify/duckduckgo-search-scraper', {
+    queries: query, // ce scraper accepte string aussi
+    maxResults: 25,
+    region: 'wt-wt',
+    safeSearch: 'moderate',
+  });
+  const dsId = run?.defaultDatasetId || run?.output?.defaultDatasetId || run?.datasetId;
+  if (!dsId) return [];
+  const ds = await Actor.openDataset(dsId);
+  const { items } = await ds.getData({ limit: 200 });
+  return (items || []).map(i => i?.url).filter(u => /kuaishou\.com\/(short-video|f)\//i.test(u));
+};
 
-  const outDs = await Actor.openDataset(serpDatasetId);
-  const { items } = await outDs.getData({ limit: 200 });
-
-  const urls = (items || [])
-    .map((it) => it?.url)
-    .filter((u) => typeof u === 'string' && /kuaishou\.com\/(short-video|f)\//i.test(u));
-
+const serpSearch = async (keyword) => {
+  // On agrège les trois, on dédoublonne
+  const [g, b, d] = await Promise.allSettled([
+    serpSearchGoogle(keyword),
+    serpSearchBing(keyword),
+    serpSearchDDG(keyword),
+  ]);
+  const urls = [
+    ...(g.status === 'fulfilled' ? g.value : []),
+    ...(b.status === 'fulfilled' ? b.value : []),
+    ...(d.status === 'fulfilled' ? d.value : []),
+  ];
   return unique(urls);
 };
 
@@ -138,7 +176,7 @@ const {
   useApifyProxy = true,
   saveBinary = true,
   acceptM3U8 = false,
-  // si tu veux passer ces champs via l’UI, ajoute-les aussi dans input_schema.json
+  // si tu veux exposer ces champs dans l’UI, ajoute-les dans input_schema.json
   apifyProxyGroups,
   apifyProxyCountry,
 } = input;
@@ -156,17 +194,15 @@ const dataset = await Dataset.open();
 // Seeds
 const startRequests = [];
 if (keyword) {
-  // www
   startRequests.push({
     url: `https://www.kuaishou.com/search/video?keyword=${encodeURIComponent(keyword)}`,
     userData: { label: 'SEARCH', source: 'www', keyword, triedMDot: false },
   });
-  // m-dot (en parallèle)
   startRequests.push({
     url: `https://m.kuaishou.com/search/video?keyword=${encodeURIComponent(keyword)}`,
     userData: { label: 'SEARCH', source: 'm', keyword, triedMDot: true },
   });
-  // SERP "synthétique" (pas de navigation)
+  // SERP synthétique (pas de navigation)
   startRequests.push({
     url: 'about:blank',
     userData: { label: 'SERP', keyword },
@@ -189,7 +225,7 @@ const crawler = new PlaywrightCrawler({
 
   preNavigationHooks: [
     async ({ page }) => {
-      // Forcer UA mobile et signaux "mobile" avant tout JS
+      // Forcer UA mobile + signaux "mobile"
       try {
         await page.addInitScript((ua) => {
           Object.defineProperty(navigator, 'userAgent', { get: () => ua });
@@ -213,7 +249,7 @@ const crawler = new PlaywrightCrawler({
     const { label, keyword: kw } = request.userData || {};
     log.info(`Open: [${label || 'DETAIL'}] ${request.url}`);
 
-    // Cas spécial: SERP "synthétique" (pas besoin de naviguer)
+    // Cas spécial: SERP synthétique
     if (label === 'SERP') {
       try {
         const serpUrls = await serpSearch(kw);
@@ -224,7 +260,7 @@ const crawler = new PlaywrightCrawler({
             userData: { label: 'DETAIL', likes: 0, rank: null },
             forefront: true,
           });
-          log.info(`SERP: ${pick.length} liens ajoutés depuis Google.`);
+          log.info(`SERP: ${pick.length} liens ajoutés depuis SERP (agg).`);
         } else {
           log.warning('SERP: aucun lien trouvé.');
         }
@@ -234,16 +270,16 @@ const crawler = new PlaywrightCrawler({
       return;
     }
 
-    // Sniffer réseau AVANT d'interagir
+    // Sniffer AVANT d’interagir
     const sniffer = attachSniffer(page);
+    await gotoRobust(page, request.url);
 
-    // Si lien de partage /f/, attends la redirection /short-video/...
+    // /f/... → attends redirection /short-video/...
     try { await page.waitForURL(/short-video|video/i, { timeout: 15000 }); } catch {}
-
     try { await page.waitForSelector('body', { timeout: 15000 }); } catch {}
 
     if (label === 'SEARCH') {
-      // Clique l’onglet "视频" si présent
+      // Onglet "视频"
       try {
         const tabVideo = page.locator('text=视频');
         if (await tabVideo.count()) {
@@ -252,7 +288,7 @@ const crawler = new PlaywrightCrawler({
         }
       } catch {}
 
-      // Attends des sélecteurs plausibles
+      // Attente de sélecteurs plausibles
       const anySelector = [
         'a[href*="/short-video/"]',
         'div[data-e2e*="card"] a[href]',
@@ -260,10 +296,10 @@ const crawler = new PlaywrightCrawler({
       ].join(',');
       try { await page.waitForSelector(anySelector, { timeout: 30000 }); } catch {}
 
-      // Scroll + récolte progressive
+      // Scroll + harvest
       let hrefs = await incrementalScrollAndHarvest(page, 7);
 
-      // Fallback: regex HTML si DOM "vide"
+      // Fallback regex HTML
       if (!hrefs || hrefs.length < 5) {
         try {
           const html = await page.content();
@@ -321,7 +357,7 @@ const crawler = new PlaywrightCrawler({
       return;
     }
 
-    // DETAIL: extraire l’URL vidéo + sauvegarder MP4 (KV) si dispo
+    // DETAIL : extraire l’URL vidéo + sauvegarder MP4
     const videoUrl = await extractVideoUrl(page, { acceptM3U8, preBag: sniffer.bag });
     sniffer.detach();
 
