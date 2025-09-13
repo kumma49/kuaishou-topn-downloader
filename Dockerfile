@@ -1,18 +1,19 @@
-# 1) Passe à Node 20 pour éviter EBADENGINE
+# Node 20 pour compatibilité des deps
 FROM apify/actor-node-playwright:20
 
-# 2) Dossier de travail
+# Dossier de travail
 WORKDIR /usr/src/app
 
-# 3) Copie des manifests avec le bon propriétaire
-COPY --chown=myuser:myuser package*.json ./
+# Copie des manifests
+COPY package*.json ./
 
-# 4) Exécute npm en tant que 'myuser' (droits ok)
-USER myuser
+# Installe les deps en root (évite les soucis de permissions)
 RUN npm install --omit=dev --no-audit --no-fund
 
-# 5) Copie du reste du code avec les bons droits
-COPY --chown=myuser:myuser . ./
+# Copie le reste du code
+COPY . ./
 
-# 6) Démarrage
+# Exécute l'actor en utilisateur non-root
+USER myuser
+
 CMD ["npm","start"]
