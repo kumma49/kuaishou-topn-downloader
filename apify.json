@@ -1,0 +1,8 @@
+{
+  "name": "kuaishou-video-scraper",
+  "version": "0.0.1",
+  "buildTag": "latest",
+  "title": "Kuaishou Video Scraper",
+  "description": "Scraper pour extraire les métadonnées et télécharger des vidéos depuis kuaishou.com en fonction d'un mot-clé.",
+  "baseDockerImage": "apify/actor-node-playwright-chrome:latest"
+}
